@@ -29,6 +29,12 @@ class DistractionDetector:
         self.distraction_count = 0
         self.total_distraction_time = 0
         
+        # eye closing tracking
+        self.eye_close_start_time = None
+        self.eyes_closed = False
+        self.eye_close_threshold = 2.0  # seconds before considering eyes closed as distraction
+        self.eye_aspect_ratio_threshold = 0.45  # threshold for eye closure detection
+        
         # Settings
         self.DISTRACTION_THRESHOLD = distraction_timer # time in seconds
         self.FACE_DISTANCE_THRESHOLD = dist_threshold
@@ -96,6 +102,27 @@ class DistractionDetector:
             maxSize=(60, 60)
         )
         
+        # calculate eye aspect ratio for closed eye detection
+        eye_closed = False
+        if len(eyes) >= 2:
+            # Get the two largest eyes (assuming they are the actual eyes)
+            eyes_sorted = sorted(eyes, key=lambda e: e[2] * e[3], reverse=True)[:2]
+            
+            # Calculate aspect ratios for both eyes
+            eye_aspect_ratios = []
+            for (ex, ey, ew, eh) in eyes_sorted:
+                aspect_ratio = ew / eh if eh > 0 else 1.0
+                eye_aspect_ratios.append(aspect_ratio)
+            
+            # if eyes are closed 
+            avg_aspect_ratio = np.mean(eye_aspect_ratios) if eye_aspect_ratios else 1.0
+            eye_closed = avg_aspect_ratio < self.eye_aspect_ratio_threshold
+        elif len(eyes) == 1:
+            # single eye detected 
+            ex, ey, ew, eh = eyes[0]
+            aspect_ratio = ew / eh if eh > 0 else 1.0
+            eye_closed = aspect_ratio < self.eye_aspect_ratio_threshold
+        
         # calc metrics
         face_center_x = (x + w/2) / frame.shape[1]
         face_center_y = (y + h/2) / frame.shape[0]
@@ -106,7 +133,8 @@ class DistractionDetector:
             'eyes': eyes,
             'eye_count': len(eyes),
             'center': (face_center_x, face_center_y),
-            'size_ratio': face_size_ratio
+            'size_ratio': face_size_ratio,
+            'eye_closed': eye_closed
         }
     
     #distraction check
@@ -118,6 +146,7 @@ class DistractionDetector:
         eye_count = face_data['eye_count']
         face_center_x, face_center_y = face_data['center']
         face_size = face_data['size_ratio']
+        eye_closed = face_data['eye_closed']
         
         #distance from calibrated center
         distance = math.sqrt((face_center_x - self.screen_center_x)**2 + (face_center_y - self.screen_center_y)**2)
@@ -132,6 +161,10 @@ class DistractionDetector:
         # looking down/away
         if eye_count < 1:
             distractions.append(f"Eyes not visible")
+        
+        # eyes closed for extended period
+        if eye_closed:
+            distractions.append(f"Eyes closing")
         
         # leaning back
         if face_size < self.MIN_FACE_SIZE:
@@ -255,6 +288,7 @@ def main():
         if face_data is not None:
             x, y, face_w, face_h = face_data['rect']
             eye_count = face_data['eye_count']
+            eye_closed = face_data['eye_closed']
             
             # Draw face rectangle
             color = (0, 255, 0) if not is_distracted else (0, 0, 255)
@@ -272,7 +306,8 @@ def main():
                 roi_color = frame[y:y + int(face_h/2), x:x+face_w]
                 eyes = face_data['eyes']
                 for (ex, ey, ew, eh) in eyes[:2]:  # Draw up to 2 eyes
-                    cv2.rectangle(roi_color, (ex, ey), (ex+ew, ey+eh), (0, 255, 255), 2)
+                    eye_color = (0, 0, 255) if eye_closed else (0, 255, 255)
+                    cv2.rectangle(roi_color, (ex, ey), (ex+ew, ey+eh), eye_color, 2)
         
         # Display status
         status_color = (0, 255, 0) if not is_distracted else (0, 0, 255)
