@@ -11,7 +11,7 @@ os.environ["QT_LOGGING_RULES"] = "qt.qpa.*=false"
 calib_factor = 0.5
 dist_threshold = 0.25
 distraction_timer = 5
-
+eyes_closed_macro_perc = 0.85
 
 class DistractionDetector:
     def __init__(self):
@@ -31,14 +31,22 @@ class DistractionDetector:
         
         # eye closing tracking
         self.eye_close_start_time = None
-        self.eyes_closed = False
-        self.eye_close_threshold = 2.0  # seconds before considering eyes closed as distraction
-        self.eye_aspect_ratio_threshold = 0.45  # threshold for eye closure detection
+        self.eyes_closed_counter = 0
+        self.eyes_open_counter = 0
+        self.eye_state_buffer = []  # Buffer to track eye state over multiple frames
+        self.eye_state_history = []  # Track eye state history
+        self.blink_detected = False
         
         # Settings
         self.DISTRACTION_THRESHOLD = distraction_timer # time in seconds
         self.FACE_DISTANCE_THRESHOLD = dist_threshold
         self.MIN_FACE_SIZE = 0.15  # min 15% of frame width
+        
+        # Eye closure settings
+        self.EYE_CLOSURE_FRAMES_THRESHOLD = 10  # Number of consecutive frames with no eyes to consider them closed
+        self.EYE_REOPEN_FRAMES_THRESHOLD = 3    # Number of consecutive frames with eyes to consider them open again
+        self.BLINK_FRAME_THRESHOLD = 5          # Blink is short closure (1-5 frames)
+        self.EYE_CLOSE_TIME_THRESHOLD = 2.0     # Seconds before considering eyes closed as distraction
         
         #calibration
         self.screen_center_x = calib_factor
@@ -87,41 +95,80 @@ class DistractionDetector:
         )
         
         if len(faces) == 0:
+            # eye state buffer
+            self.eye_state_buffer.append(False)
+            if len(self.eye_state_buffer) > 20:
+                self.eye_state_buffer.pop(0)
             return None
         
         # get the user, not the people around
         x, y, w, h = max(faces, key=lambda f: f[2] * f[3])
         
-        # detect eyes
+        # detect eyes in the upper half of the face
         roi_gray = gray[y:y + int(h/2), x:x+w]
         eyes = self.eye_cascade.detectMultiScale(
             roi_gray,
-            scaleFactor=1.05,
-            minNeighbors=5,
-            minSize=(25, 25),
-            maxSize=(60, 60)
+            scaleFactor=1.1,
+            minNeighbors=7,
+            minSize=(20, 20),
+            maxSize=(70, 70)
         )
         
-        # calculate eye aspect ratio for closed eye detection
-        eye_closed = False
-        if len(eyes) >= 2:
-            # Get the two largest eyes (assuming they are the actual eyes)
-            eyes_sorted = sorted(eyes, key=lambda e: e[2] * e[3], reverse=True)[:2]
+        # filter eyes so biggest ones get picked
+        filtered_eyes = []
+        if len(eyes) > 0:
+            # sort
+            eyes = sorted(eyes, key=lambda e: e[2] * e[3], reverse=True)
+            for i in range(min(2, len(eyes))):
+                if i == 0:
+                    filtered_eyes.append(eyes[i])
+                else:
+                    # check if its the same person
+                    ex1, ey1, ew1, eh1 = eyes[0]
+                    ex2, ey2, ew2, eh2 = eyes[i]
+                    distance = math.sqrt((ex2 - ex1)**2 + (ey2 - ey1)**2)
+                    if distance > 20:  # min distance between eyes
+                        filtered_eyes.append(eyes[i])
+        
+        eyes = filtered_eyes
+        eye_count = len(eyes)
+        
+        # update eye state tracking
+        eyes_detected = eye_count >= 1
+        
+        # add to buffer
+        self.eye_state_buffer.append(eyes_detected)
+        if len(self.eye_state_buffer) > 20:
+            self.eye_state_buffer.pop(0)
+        
+        # determine if eyes are consistently closed
+        if len(self.eye_state_buffer) >= 5:
+            recent_eye_states = self.eye_state_buffer[-5:]
+            eyes_closed_percentage = 1 - (sum(recent_eye_states) / len(recent_eye_states))
             
-            # Calculate aspect ratios for both eyes
-            eye_aspect_ratios = []
-            for (ex, ey, ew, eh) in eyes_sorted:
-                aspect_ratio = ew / eh if eh > 0 else 1.0
-                eye_aspect_ratios.append(aspect_ratio)
-            
-            # if eyes are closed 
-            avg_aspect_ratio = np.mean(eye_aspect_ratios) if eye_aspect_ratios else 1.0
-            eye_closed = avg_aspect_ratio < self.eye_aspect_ratio_threshold
-        elif len(eyes) == 1:
-            # single eye detected 
-            ex, ey, ew, eh = eyes[0]
-            aspect_ratio = ew / eh if eh > 0 else 1.0
-            eye_closed = aspect_ratio < self.eye_aspect_ratio_threshold
+            if eyes_closed_percentage > eyes_closed_macro_perc:
+                eyes_consistently_closed = True
+            else:
+                eyes_consistently_closed = False
+        else:
+            eyes_consistently_closed = False
+        
+        # check for blink 
+        self.eye_state_history.append(eyes_detected)
+        if len(self.eye_state_history) > 30:
+            self.eye_state_history.pop(0)
+        
+        self.blink_detected = False
+        if len(self.eye_state_history) >= 10:
+            # blinking pattern
+            recent_history = self.eye_state_history[-10:]
+            for i in range(len(recent_history) - 2):
+                if (recent_history[i] and  # open
+                    not recent_history[i+1] and  # closed
+                    recent_history[i+2]):  # open again
+                    if i+2 - i <= self.BLINK_FRAME_THRESHOLD: 
+                        self.blink_detected = True
+                        break
         
         # calc metrics
         face_center_x = (x + w/2) / frame.shape[1]
@@ -131,14 +178,16 @@ class DistractionDetector:
         return {
             'rect': (x, y, w, h),
             'eyes': eyes,
-            'eye_count': len(eyes),
+            'eye_count': eye_count,
             'center': (face_center_x, face_center_y),
             'size_ratio': face_size_ratio,
-            'eye_closed': eye_closed
+            'eyes_detected': eyes_detected,
+            'eyes_consistently_closed': eyes_consistently_closed,
+            'blink_detected': self.blink_detected
         }
     
     #distraction check
-    def check_distraction(self, face_data, frame_shape):
+    def check_distraction(self, face_data, frame_shape, current_time):
         if face_data is None:
             return True, "No face detected", 0
         
@@ -146,25 +195,37 @@ class DistractionDetector:
         eye_count = face_data['eye_count']
         face_center_x, face_center_y = face_data['center']
         face_size = face_data['size_ratio']
-        eye_closed = face_data['eye_closed']
+        eyes_consistently_closed = face_data['eyes_consistently_closed']
+        blink_detected = face_data['blink_detected']
         
         #distance from calibrated center
         distance = math.sqrt((face_center_x - self.screen_center_x)**2 + (face_center_y - self.screen_center_y)**2)
         
-        # Check multiple distraction conditions
+        # multiple distraction conditions
         distractions = []
         
         # face too far from center
         if distance > self.FACE_DISTANCE_THRESHOLD:
             distractions.append(f"Face off-center")
         
-        # looking down/away
-        if eye_count < 1:
-            distractions.append(f"Eyes not visible")
+        # eyes consistently closed (not just blinking)
+        if eyes_consistently_closed and not blink_detected:
+            distractions.append(f"Eyes closed")
+            
+            # start or update eye closure timer
+            if self.eye_close_start_time is None:
+                self.eye_close_start_time = current_time
+            else:
+                eye_close_duration = current_time - self.eye_close_start_time
+                if eye_close_duration > self.EYE_CLOSE_TIME_THRESHOLD:
+                    distractions.append(f"Eyes closed too long")
+        else:
+            # reset eye close time 
+            self.eye_close_start_time = None
         
-        # eyes closed for extended period
-        if eye_closed:
-            distractions.append(f"Eyes closing")
+        # looking down/away (no eyes detected but face detected)
+        if eye_count < 1 and not eyes_consistently_closed:
+            distractions.append(f"Eyes not visible")
         
         # leaning back
         if face_size < self.MIN_FACE_SIZE:
@@ -267,6 +328,7 @@ def main():
     print("\nCalibration complete!")
     
     # main detection loop
+    frame_count = 0
     while True:
         ret, frame = cap.read()
         if not ret:
@@ -274,9 +336,10 @@ def main():
         
         frame = cv2.flip(frame, 1)
         current_time = time.time()
+        frame_count += 1
         
         face_data = detector.detect_face_and_eyes(frame)
-        is_distracted, reason, distance = detector.check_distraction(face_data, frame.shape)
+        is_distracted, reason, distance = detector.check_distraction(face_data, frame.shape, current_time)
         distraction_duration = detector.update_distraction_state(is_distracted, current_time)
         h, w = frame.shape[:2]
         screen_x = int(detector.screen_center_x * w)
@@ -288,7 +351,8 @@ def main():
         if face_data is not None:
             x, y, face_w, face_h = face_data['rect']
             eye_count = face_data['eye_count']
-            eye_closed = face_data['eye_closed']
+            eyes_consistently_closed = face_data['eyes_consistently_closed']
+            blink_detected = face_data['blink_detected']
             
             # Draw face rectangle
             color = (0, 255, 0) if not is_distracted else (0, 0, 255)
@@ -301,12 +365,30 @@ def main():
             cv2.line(frame, (face_center_x, face_center_y), 
                     (screen_x, screen_y), color, 2)
             
-            # Draw eyes if detected
+            #eye status indicator
+            eye_status_color = (0, 255, 0)  # green for open
+            eye_status_text = "Eyes: Open"
+            
+            if eyes_consistently_closed:
+                if blink_detected:
+                    eye_status_color = (0, 255, 255)  # yellow for blink
+                    eye_status_text = "Eyes: Blink"
+                else:
+                    eye_status_color = (0, 0, 255)  # red for closed
+                    eye_status_text = "Eyes: Closed"
+            elif eye_count < 1:
+                eye_status_color = (255, 165, 0)  # orange for not detected
+                eye_status_text = "Eyes: Not visible"
+            
+            cv2.putText(frame, eye_status_text, (x, y - 10), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, eye_status_color, 2)
+            
+            # draw eyes if detected
             if eye_count > 0:
                 roi_color = frame[y:y + int(face_h/2), x:x+face_w]
                 eyes = face_data['eyes']
-                for (ex, ey, ew, eh) in eyes[:2]:  # Draw up to 2 eyes
-                    eye_color = (0, 0, 255) if eye_closed else (0, 255, 255)
+                for (ex, ey, ew, eh) in eyes:
+                    eye_color = (0, 0, 255) if eyes_consistently_closed else (0, 255, 255)
                     cv2.rectangle(roi_color, (ex, ey), (ex+ew, ey+eh), eye_color, 2)
         
         # Display status
@@ -357,6 +439,10 @@ def main():
         cv2.putText(frame, controls_text, (10, controls_y), 
                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 150), 1)
         
+        #frame counter for debugging
+        cv2.putText(frame, f"Frame: {frame_count}", (w - 100, 30), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 150), 1)
+        
         # show frame
         cv2.imshow("Phone/Screen Distraction Detector", frame)
         
@@ -369,6 +455,9 @@ def main():
             detector.distraction_start_time = None
             detector.distraction_count = 0
             detector.total_distraction_time = 0
+            detector.eye_state_buffer = []
+            detector.eye_state_history = []
+            detector.eye_close_start_time = None
             session_start = time.time()
             print("Statistics reset!")
         elif key == ord('c'):
