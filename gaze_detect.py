@@ -3,6 +3,10 @@ import numpy as np
 import time
 import math
 import os
+import random
+import threading
+import subprocess
+import platform
 
 # suppress warnings
 os.environ["QT_LOGGING_RULES"] = "qt.qpa.*=false"
@@ -13,6 +17,154 @@ dist_threshold = 0.25
 distraction_timer = 5
 eyes_closed_macro_perc = 0.85
 
+class VideoPlayer:
+    """Separate video player that uses system's default video player"""
+    def __init__(self, video_folder="videos"):
+        self.video_folder = video_folder
+        self.is_playing = False
+        self.current_process = None
+
+    def play_random_video_opencv(self):
+        """Play random video using OpenCV (guaranteed auto-play, but simple window)"""
+        if not os.path.exists(self.video_folder):
+            print(f"Warning: Video folder '{self.video_folder}' not found!")
+            return False
+            
+        video_files = [f for f in os.listdir(self.video_folder) 
+                      if f.lower().endswith(('.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.webm'))]
+        
+        if not video_files:
+            print(f"No video files found in '{self.video_folder}'!")
+            return False
+        
+        # select random video
+        video_file = random.choice(video_files)
+        video_path = os.path.join(self.video_folder, video_file)
+        
+        print(f"Playing video with OpenCV: {video_file}")
+        
+        def play_video():
+            cap = cv2.VideoCapture(video_path)
+            if not cap.isOpened():
+                print(f"Could not open video: {video_path}")
+                return
+            
+            # Get video properties
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            if fps <= 0:
+                fps = 30
+            
+            cv2.namedWindow("Distraction Alert - Watch This!", cv2.WINDOW_NORMAL)
+            cv2.resizeWindow("Distraction Alert - Watch This!", 800, 600)
+            
+            while self.is_playing:
+                ret, frame = cap.read()
+                if not ret:
+                    # Loop video
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    continue
+                
+                cv2.imshow("Distraction Alert - Watch This!", frame)
+                
+                # Break if user presses ESC or window is closed
+                if cv2.waitKey(int(1000/fps)) & 0xFF == 27:
+                    break
+                if cv2.getWindowProperty("Distraction Alert - Watch This!", cv2.WND_PROP_VISIBLE) < 1:
+                    break
+            
+            cap.release()
+            cv2.destroyWindow("Distraction Alert - Watch This!")
+    
+        # Start playing in a thread
+        self.is_playing = True
+        threading.Thread(target=play_video, daemon=True).start()
+        return True
+
+
+    def play_random_video(self):
+        if not os.path.exists(self.video_folder):
+            print(f"Warning: Video folder '{self.video_folder}' not found!")
+            return False
+            
+        video_files = [f for f in os.listdir(self.video_folder) 
+                        if f.lower().endswith(('.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.webm'))]
+        
+        if not video_files:
+            print(f"No video files found in '{self.video_folder}'!")
+            return False
+        
+        # select random video
+        video_file = random.choice(video_files)
+        video_path = os.path.abspath(os.path.join(self.video_folder, video_file))
+        
+        print(f"Playing video: {video_file}")
+        
+        def play_video():
+            try:
+                system = platform.system()
+                
+                if system == "Darwin":  # macOS
+                    # Use AppleScript to open and autoplay in QuickTime
+                    applescript = f'''
+                    tell application "QuickTime Player"
+                        activate
+                        open POSIX file "{video_path}"
+                        tell front document
+                            play
+                        end tell
+                    end tell
+                    '''
+                    self.current_process = subprocess.Popen(
+                        ['osascript', '-e', applescript],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE
+                    )
+                    print(f"Video playing in QuickTime Player")
+                    
+                elif system == "Windows":
+                    # Use default Windows video player
+                    self.current_process = subprocess.Popen(['start', '', video_path], shell=True)
+                else:  # Linux
+                    # Try common Linux video players
+                    try:
+                        self.current_process = subprocess.Popen(['xdg-open', video_path])
+                    except:
+                        self.current_process = subprocess.Popen(['vlc', video_path])
+                
+            except Exception as e:
+                print(f"Error opening video: {e}")
+                self.is_playing = False
+                return
+        
+        # Start playing in a thread
+        self.is_playing = True
+        threading.Thread(target=play_video, daemon=True).start()
+        return True
+                
+    def stop_video(self):
+            """Stop the video (close the player window)"""
+            if self.is_playing:
+                try:
+                    self.is_playing = False
+                    
+                    # Try to terminate the video player process
+                    if self.current_process:
+                        try:
+                            self.current_process.terminate()
+                            self.current_process.wait(timeout=1)
+                        except:
+                            try:
+                                self.current_process.kill()
+                            except:
+                                pass
+                        self.current_process = None
+                    
+                except Exception as e:
+                    print(f"Warning: Could not stop video player: {e}")
+                finally:
+                    self.is_playing = False
+
+                
 class DistractionDetector:
     def __init__(self):
         # load face and eye detectors
@@ -53,6 +205,12 @@ class DistractionDetector:
         self.screen_center_y = calib_factor
         self.is_calibrated = False
         self.calibration_frames = []
+        
+        # video player
+        self.video_player = VideoPlayer("videos")
+        self.video_thread = None
+        self.extended_distraction_start = None
+        self.video_played_this_distraction = False
         
     def calibrate(self, frame):
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -247,9 +405,27 @@ class DistractionDetector:
                 self.distraction_start_time = current_time
                 self.distraction_count += 1
                 self.is_distracted = True
+                self.video_played_this_distraction = False
             
             distraction_duration = current_time - self.distraction_start_time
-            # add to total if it's a new second of distraction
+            
+            # check for extended distraction (30+ seconds) and haven't played video yet
+            if distraction_duration > 30 and not self.video_played_this_distraction:
+                if self.extended_distraction_start is None:
+                    self.extended_distraction_start = current_time
+                    print(f"Starting video after 30 seconds of distraction")
+                
+                # Play video in a separate thread
+                if not self.video_player.is_playing:
+                    print(f"Attempting to play video...")
+                    # Store reference to prevent garbage collection
+                    self.video_thread = threading.Thread(
+                        target=self.video_player.play_random_video,
+                        daemon=True
+                    )
+                    self.video_thread.start()
+                    self.video_played_this_distraction = True
+
             if distraction_duration >= 1.0:
                 self.total_distraction_time = max(self.total_distraction_time, distraction_duration)
             
@@ -257,6 +433,16 @@ class DistractionDetector:
         else:
             self.distraction_start_time = None
             self.is_distracted = False
+            self.extended_distraction_start = None
+            self.video_played_this_distraction = False
+            
+            # stop video player if user returns to focus
+            try:
+                if self.video_player and self.video_player.is_playing:
+                    self.video_player.stop_video()
+            except Exception as e:
+                print(f"Error stopping video player: {e}")
+            
             return 0
 
 def main():
@@ -268,12 +454,22 @@ def main():
     print("1. Sit in your normal working position")
     print("2. Look at the screen center during calibration")
     print("3. System will alert when you look away")
-    print("4. Press 'q' to quit, 'r' to reset, 'c' to recalibrate")
+    print("4. Video will play if distracted for 30+ seconds")
+    print("5. Video opens in system's default media player")
+    print("6. Press 'q' to quit, 'r' to reset, 'c' to recalibrate")
     print("="*60)
     
-    # init
+# init
     detector = DistractionDetector()
     cap = cv2.VideoCapture(0)
+    
+    # Give camera time to initialize
+    time.sleep(2)
+    
+    if not cap.isOpened():
+        print("Error: Could not open camera. Trying alternative method...")
+        cap = cv2.VideoCapture(0, cv2.CAP_AVFOUNDATION)
+        time.sleep(2)
     
     # camera properties
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
@@ -321,9 +517,10 @@ def main():
         
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
-            cap.release()
-            cv2.destroyAllWindows()
-            return
+            if detector.video_player:
+                detector.video_player.stop_video()
+                time.sleep(0.1)
+            break
     
     print("\nCalibration complete!")
     
@@ -408,6 +605,14 @@ def main():
                 timer_text = f"Time: {distraction_duration:.1f}s"
                 cv2.putText(frame, timer_text, 
                            (10, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 1)
+                
+                # show video warning if approaching 30 seconds
+                if distraction_duration > 25 and distraction_duration <= 30:
+                    warning_text = f"Video will play in {30-int(distraction_duration)}s if you don't focus!"
+                    text_size = cv2.getTextSize(warning_text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)[0]
+                    text_x = (w - text_size[0]) // 2
+                    cv2.putText(frame, warning_text, (text_x, 120), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 100, 255), 2)
         
         # alarm for extended distraction
         if is_distracted and distraction_duration > detector.DISTRACTION_THRESHOLD:
@@ -439,6 +644,15 @@ def main():
         cv2.putText(frame, controls_text, (10, controls_y), 
                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 150), 1)
         
+        # show video status if active
+        if detector.video_player and detector.video_player.is_playing:
+            video_text = "VIDEO PLAYING - Focus to stop!"
+            text_size = cv2.getTextSize(video_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+            text_x = (w - text_size[0]) // 2
+            cv2.rectangle(frame, (text_x-10, 150), (text_x+text_size[0]+10, 180), (0, 0, 0), -1)
+            cv2.putText(frame, video_text, (text_x, 175), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+            
         #frame counter for debugging
         cv2.putText(frame, f"Frame: {frame_count}", (w - 100, 30), 
                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 150), 1)
@@ -449,6 +663,9 @@ def main():
         # keyboard input
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
+            if detector.video_player:
+                detector.video_player.stop_video()
+                time.sleep(0.1)
             break
         elif key == ord('r'):
             # Reset statistics
@@ -458,15 +675,34 @@ def main():
             detector.eye_state_buffer = []
             detector.eye_state_history = []
             detector.eye_close_start_time = None
+            detector.extended_distraction_start = None
+            detector.video_played_this_distraction = False
+            if detector.video_player:
+                detector.video_player.stop_video()
+                time.sleep(0.1)
             session_start = time.time()
             print("Statistics reset!")
+            # Force focus status
+            detector.is_distracted = False
         elif key == ord('c'):
             # Recalibrate
+            print("Starting recalibration... Look at screen center")
+            
+            # Stop video player first
+            if detector.video_player:
+                detector.video_player.stop_video()
+                time.sleep(0.1)
+            
+            # Reset calibration state
             detector.is_calibrated = False
             detector.calibration_frames = []
-            print("Recalibrating... Look at screen center")
+            detector.distraction_start_time = None
+            detector.is_distracted = False
+            detector.video_played_this_distraction = False
             
             recalibrating = True
+            recal_frames = 0
+            
             while recalibrating:
                 ret, frame = cap.read()
                 if not ret:
@@ -477,11 +713,17 @@ def main():
                 # calibration instructions
                 cv2.putText(frame, "RECALIBRATING: Look at screen center", 
                            (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                cv2.putText(frame, f"Frames collected: {recal_frames}/30", 
+                           (50, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
                 cv2.circle(frame, (w//2, h//2), 10, (0, 255, 255), -1)
                 
                 if detector.calibrate(frame):
+                    recal_frames = len(detector.calibration_frames)
+                
+                if detector.is_calibrated:
                     recalibrating = False
                     print("Recalibration complete!")
+                    break
                 
                 cv2.imshow("Phone/Screen Distraction Detector", frame)
                 
@@ -490,6 +732,7 @@ def main():
                     break
     
     # cleanup
+    detector.video_player.stop_video()
     cap.release()
     cv2.destroyAllWindows()
     
