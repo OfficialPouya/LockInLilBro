@@ -718,7 +718,7 @@ def main():
                     warning_text = f"Video will play in {15-int(distraction_duration)}s"
                     text_size = cv2.getTextSize(warning_text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)[0]
                     text_x = (w - text_size[0]) // 2
-                    cv2.putText(frame, warning_text, (text_x, 120), 
+                    cv2.putText(frame, warning_text, (text_x, 130), 
                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 100, 255), 2)
         
         # alarm for extended distraction
@@ -727,12 +727,6 @@ def main():
             if current_time - last_alarm_time > alarm_interval:
                 cv2.rectangle(frame, (0, 0), (w, h), (0, 0, 255), 15)
                 last_alarm_time = current_time
-            
-            # warning message
-            warning_text = f"ON YOUR PHONE! Look back at screen!"
-            text_size = cv2.getTextSize(warning_text, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)[0]
-            text_x = (w - text_size[0]) // 2
-            cv2.putText(frame, warning_text, (text_x, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
         
         # stats
         session_duration = current_time - session_start
