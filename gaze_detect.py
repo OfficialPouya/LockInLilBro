@@ -15,7 +15,7 @@ os.environ["QT_LOGGING_RULES"] = "qt.qpa.*=false"
 calib_factor = 0.5
 dist_threshold = 0.25
 distraction_timer = 5
-eyes_closed_macro_perc = 0.85
+eyes_closed_macro_perc = 0.75 
 
 class VideoPlayer:
     """Separate video player that uses system's default video player"""
@@ -208,6 +208,41 @@ class VideoPlayer:
                                 pass
                         self.current_process = None
                     
+                    # macOS specific: Force close QuickTime Player windows
+                    if platform.system() == "Darwin":
+                        try:
+                            close_script = '''
+                            tell application "QuickTime Player"
+                                if it is running then
+                                    close every window
+                                    delay 0.5
+                                    quit
+                                end if
+                            end tell
+                            '''
+                            subprocess.run(['osascript', '-e', close_script], 
+                                        stdout=subprocess.PIPE, 
+                                        stderr=subprocess.PIPE, 
+                                        timeout=5)
+                            print("QuickTime Player closed")
+                        except Exception as e:
+                            print(f"Note: Could not close QuickTime gracefully: {e}")
+                            # Force quit as fallback
+                            try:
+                                force_quit = '''
+                                tell application "System Events"
+                                    if exists (process "QuickTime Player") then
+                                        tell process "QuickTime Player" to quit
+                                    end if
+                                end tell
+                                '''
+                                subprocess.run(['osascript', '-e', force_quit], 
+                                            stdout=subprocess.PIPE, 
+                                            stderr=subprocess.PIPE, 
+                                            timeout=3)
+                            except:
+                                pass
+                    
                 except Exception as e:
                     print(f"Warning: Could not stop video player: {e}")
                 finally:
@@ -262,6 +297,9 @@ class DistractionDetector:
         self.video_played_this_distraction = False
         self.focus_regained_time = None  
         
+        # Video trigger time changed to 15 seconds
+        self.VIDEO_TRIGGER_TIME = 15
+        
     def calibrate(self, frame):
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         faces = self.face_cascade.detectMultiScale(gray, 1.1, 4)
@@ -314,34 +352,43 @@ class DistractionDetector:
         
         # detect eyes in the upper half of the face
         roi_gray = gray[y:y + int(h/2), x:x+w]
+        
+        # Use original working parameters but with slightly better range
         eyes = self.eye_cascade.detectMultiScale(
             roi_gray,
             scaleFactor=1.1,
-            minNeighbors=7,
-            minSize=(20, 20),
-            maxSize=(70, 70)
+            minNeighbors=5,      # Back to original 5
+            minSize=(20, 20),    # Back to original 20,20
+            maxSize=(w//2, h//2) # Dynamic max but less restrictive
         )
         
-        # filter eyes so biggest ones get picked
         filtered_eyes = []
         if len(eyes) > 0:
-            # sort
+            # sorting by area
             eyes = sorted(eyes, key=lambda e: e[2] * e[3], reverse=True)
-            for i in range(min(2, len(eyes))):
-                if i == 0:
-                    filtered_eyes.append(eyes[i])
-                else:
-                    # check if its the same person
-                    ex1, ey1, ew1, eh1 = eyes[0]
-                    ex2, ey2, ew2, eh2 = eyes[i]
-                    distance = math.sqrt((ex2 - ex1)**2 + (ey2 - ey1)**2)
-                    if distance > 20:  # min distance between eyes
-                        filtered_eyes.append(eyes[i])
+            
+            for (ex, ey, ew, eh) in eyes:
+                # eyes should be in the top 60%
+                if ey < int(h/2) * 0.6: 
+                    if len(filtered_eyes) == 0:
+                        filtered_eyes.append((ex, ey, ew, eh))
+                    else:
+                        too_close = False
+                        for (sx, sy, sw, sh) in filtered_eyes:
+                            dist = math.sqrt((ex-sx)**2 + (ey-sy)**2)
+                            if dist < max(ew, sw) * 0.8:  # tooo close
+                                too_close = True
+                                break
+                        if not too_close:
+                            filtered_eyes.append((ex, ey, ew, eh))
+                        
+                        if len(filtered_eyes) >= 2:
+                            break
         
         eyes = filtered_eyes
         eye_count = len(eyes)
         
-        # update eye state tracking
+        # update eye state tracking - simpler logic
         eyes_detected = eye_count >= 1
         
         # add to buffer
@@ -349,34 +396,26 @@ class DistractionDetector:
         if len(self.eye_state_buffer) > 20:
             self.eye_state_buffer.pop(0)
         
-        # determine if eyes are consistently closed
         if len(self.eye_state_buffer) >= 5:
-            recent_eye_states = self.eye_state_buffer[-5:]
-            eyes_closed_percentage = 1 - (sum(recent_eye_states) / len(recent_eye_states))
-            
-            if eyes_closed_percentage > eyes_closed_macro_perc:
-                eyes_consistently_closed = True
-            else:
-                eyes_consistently_closed = False
+            recent_frames = self.eye_state_buffer[-5:]
+            # avg
+            eyes_open_ratio = sum(recent_frames) / len(recent_frames)
+            eyes_closed_percentage = 1.0 - eyes_open_ratio
+            eyes_consistently_closed = eyes_closed_percentage > eyes_closed_macro_perc
         else:
             eyes_consistently_closed = False
         
-        # check for blink 
+        # simplified blink detection: look for quick open-closed-open pattern
         self.eye_state_history.append(eyes_detected)
-        if len(self.eye_state_history) > 30:
+        if len(self.eye_state_history) > 15:  # Keep shorter history
             self.eye_state_history.pop(0)
         
         self.blink_detected = False
-        if len(self.eye_state_history) >= 10:
-            # blinking pattern
-            recent_history = self.eye_state_history[-10:]
-            for i in range(len(recent_history) - 2):
-                if (recent_history[i] and  # open
-                    not recent_history[i+1] and  # closed
-                    recent_history[i+2]):  # open again
-                    if i+2 - i <= self.BLINK_FRAME_THRESHOLD: 
-                        self.blink_detected = True
-                        break
+        if len(self.eye_state_history) >= 3:
+            # pattern: check last 3 frames for open-closed-open
+            recent = self.eye_state_history[-3:]
+            if recent == [True, False, True]:
+                self.blink_detected = True
         
         # calc metrics
         face_center_x = (x + w/2) / frame.shape[1]
@@ -460,11 +499,11 @@ class DistractionDetector:
             
             distraction_duration = current_time - self.distraction_start_time
             
-            # check for extended distraction (30+ seconds) and haven't played video yet
-            if distraction_duration > 30 and not self.video_played_this_distraction:
+            # check for extended distraction (now 15 seconds) and haven't played video yet
+            if distraction_duration > self.VIDEO_TRIGGER_TIME and not self.video_played_this_distraction:
                 if self.extended_distraction_start is None:
                     self.extended_distraction_start = current_time
-                    print(f"Starting video after 30 seconds of distraction")
+                    print(f"Starting video after {self.VIDEO_TRIGGER_TIME} seconds of distraction")
                 
                 # Play video in a separate thread
                 if not self.video_player.is_playing:
@@ -478,7 +517,7 @@ class DistractionDetector:
                     self.video_played_this_distraction = True
             
             # If video is playing and user is still distracted, make sure it's playing (not paused)
-            if self.video_player.is_playing and distraction_duration > 30:
+            if self.video_player.is_playing and distraction_duration > self.VIDEO_TRIGGER_TIME:
                 # Resume video if it was paused
                 self.video_player.resume_video()
                 self.focus_regained_time = None  # Reset focus timer
@@ -522,7 +561,7 @@ def main():
     print("1. Sit in your normal working position")
     print("2. Look at the screen center during calibration")
     print("3. System will alert when you look away")
-    print("4. Video will play if distracted for 30+ seconds")
+    print("4. Video will play if distracted for 15+ seconds")
     print("5. Video opens in system's default media player")
     print("6. Press 'q' to quit, 'r' to reset, 'c' to recalibrate")
     print("="*60)
@@ -531,13 +570,13 @@ def main():
     detector = DistractionDetector()
     cap = cv2.VideoCapture(0)
     
-    # Give camera time to initialize
-    time.sleep(2)
+    # giving camera time to initialize
+    time.sleep(5)
     
     if not cap.isOpened():
         print("Error: Could not open camera. Trying alternative method...")
         cap = cv2.VideoCapture(0, cv2.CAP_AVFOUNDATION)
-        time.sleep(2)
+        time.sleep(3)
     
     # camera properties
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
@@ -674,9 +713,9 @@ def main():
                 cv2.putText(frame, timer_text, 
                            (10, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 1)
                 
-                # show video warning if approaching 30 seconds
-                if distraction_duration > 25 and distraction_duration <= 30:
-                    warning_text = f"Video will play in {30-int(distraction_duration)}s if you don't focus!"
+                # show video warning if approaching 15 seconds (updated)
+                if distraction_duration > 12 and distraction_duration <= 15:
+                    warning_text = f"Video will play in {15-int(distraction_duration)}s"
                     text_size = cv2.getTextSize(warning_text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)[0]
                     text_x = (w - text_size[0]) // 2
                     cv2.putText(frame, warning_text, (text_x, 120), 
