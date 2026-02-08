@@ -104,12 +104,13 @@ class VideoPlayer:
                 system = platform.system()
                 
                 if system == "Darwin":  # macOS
-                    # Use AppleScript to open and autoplay in QuickTime
+                    # Use AppleScript to open and autoplay in QuickTime with looping
                     applescript = f'''
                     tell application "QuickTime Player"
                         activate
                         open POSIX file "{video_path}"
                         tell front document
+                            set looping to true
                             play
                         end tell
                     end tell
@@ -119,7 +120,7 @@ class VideoPlayer:
                         stdout=subprocess.PIPE,
                         stderr=subprocess.PIPE
                     )
-                    print(f"Video playing in QuickTime Player")
+                    print(f"Video playing in QuickTime Player with looping enabled")
                     
                 elif system == "Windows":
                     # Use default Windows video player
@@ -140,7 +141,55 @@ class VideoPlayer:
         self.is_playing = True
         threading.Thread(target=play_video, daemon=True).start()
         return True
+    
+    def pause_video(self):
+            """Pause the video playback"""
+            try:
+                system = platform.system()
                 
+                if system == "Darwin":  # macOS
+                    applescript = '''
+                    tell application "QuickTime Player"
+                        tell front document
+                            pause
+                        end tell
+                    end tell
+                    '''
+                    subprocess.run(['osascript', '-e', applescript], 
+                                stdout=subprocess.PIPE, 
+                                stderr=subprocess.PIPE)
+                    print("Video paused")
+                elif system == "Windows":
+                    # Windows handling would go here
+                    pass
+                    
+            except Exception as e:
+                print(f"Error pausing video: {e}")
+
+    def resume_video(self):
+        """Resume the video playback"""
+        try:
+            system = platform.system()
+            
+            if system == "Darwin":  # macOS
+                applescript = '''
+                tell application "QuickTime Player"
+                    tell front document
+                        play
+                    end tell
+                end tell
+                '''
+                subprocess.run(['osascript', '-e', applescript], 
+                                stdout=subprocess.PIPE, 
+                                stderr=subprocess.PIPE)
+                print("Video resumed")
+            elif system == "Windows":
+                # Windows handling would go here
+                pass
+                
+        except Exception as e:
+            print(f"Error resuming video: {e}")
+
     def stop_video(self):
             """Stop the video (close the player window)"""
             if self.is_playing:
@@ -211,6 +260,7 @@ class DistractionDetector:
         self.video_thread = None
         self.extended_distraction_start = None
         self.video_played_this_distraction = False
+        self.focus_regained_time = None  
         
     def calibrate(self, frame):
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -398,7 +448,7 @@ class DistractionDetector:
         
         return is_distracted, reason, distance
     
-    # distraction timer
+   # distraction timer
     def update_distraction_state(self, is_distracted, current_time):
         if is_distracted:
             if self.distraction_start_time is None:
@@ -406,6 +456,7 @@ class DistractionDetector:
                 self.distraction_count += 1
                 self.is_distracted = True
                 self.video_played_this_distraction = False
+                self.focus_regained_time = None  # Reset focus timer
             
             distraction_duration = current_time - self.distraction_start_time
             
@@ -425,23 +476,40 @@ class DistractionDetector:
                     )
                     self.video_thread.start()
                     self.video_played_this_distraction = True
+            
+            # If video is playing and user is still distracted, make sure it's playing (not paused)
+            if self.video_player.is_playing and distraction_duration > 30:
+                # Resume video if it was paused
+                self.video_player.resume_video()
+                self.focus_regained_time = None  # Reset focus timer
 
             if distraction_duration >= 1.0:
                 self.total_distraction_time = max(self.total_distraction_time, distraction_duration)
             
             return distraction_duration
         else:
+            # User has regained focus
+            if self.video_player.is_playing:
+                # Start tracking how long they've been focused
+                if self.focus_regained_time is None:
+                    self.focus_regained_time = current_time
+                    # Pause the video when focus is regained
+                    self.video_player.pause_video()
+                    print("Focus regained - Video paused")
+                
+                # Check if they've maintained focus for 5 seconds
+                focus_duration = current_time - self.focus_regained_time
+                if focus_duration >= 5:
+                    # Close the video player after 5 seconds of maintained focus
+                    print("Focus maintained for 5 seconds - Closing video")
+                    self.video_player.stop_video()
+                    self.focus_regained_time = None
+            else:
+                self.focus_regained_time = None
+            
             self.distraction_start_time = None
             self.is_distracted = False
             self.extended_distraction_start = None
-            self.video_played_this_distraction = False
-            
-            # stop video player if user returns to focus
-            try:
-                if self.video_player and self.video_player.is_playing:
-                    self.video_player.stop_video()
-            except Exception as e:
-                print(f"Error stopping video player: {e}")
             
             return 0
 
